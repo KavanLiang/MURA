@@ -17,27 +17,27 @@ import matplotlib.pyplot as plt
 SEED = 69
 
 IMAGE_DIM = 200
+DATA_TYPE = 'float16'
 
 callbacks = [
-    ModelCheckpoint(f'x{IMAGE_DIM}'+'-weights.{epoch:02d}-{val_loss:.2f}.hdf5', monitor='val_loss', save_best_only=True, verbose=1)
+    ModelCheckpoint(f'xr{IMAGE_DIM}-{DATA_TYPE}'+'-weights.{epoch:02d}-{val_loss:.2f}.hdf5', monitor='val_loss', save_best_only=True, verbose=1)
 ]
 
 aug = ImageDataGenerator(rotation_range=2, width_shift_range=0.02,
                          height_shift_range=0.02, shear_range=0.02, zoom_range=0.02,
                          horizontal_flip=True)
 
-
 def model():
     ret = Sequential()
 
     ret.add(Conv2D(64, kernel_size=(3, 3), strides=(2, 2), activation='relu', input_shape=(IMAGE_DIM, IMAGE_DIM, 1)))
     ret.add(BatchNormalization())
-    ret.add(Conv2D(64, kernel_size=(3, 3), strides=(2, 2), activation='relu'))
-    ret.add(BatchNormalization())
     ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
 
     ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
     ret.add(BatchNormalization())
+    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
     ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
     ret.add(BatchNormalization())
     ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
@@ -45,16 +45,19 @@ def model():
     ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu'))
     ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu'))
     ret.add(BatchNormalization())
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu'))
+    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
+    ret.add(Conv2D(512, kernel_size=(3, 3), activation='relu'))
+    ret.add(Conv2D(512, kernel_size=(3, 3), activation='relu'))
     ret.add(BatchNormalization())
     ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
 
     ret.add(Flatten())
+    ret.add(Dense(2048, activation='relu'))
+    ret.add(Dropout(0.5))
     ret.add(Dense(1024, activation='relu'))
-    ret.add(Dropout(0.3))
+    ret.add(Dropout(0.5))
     ret.add(Dense(1024, activation='relu'))
-    ret.add(Dropout(0.3))
+    ret.add(Dropout(0.5))
     ret.add(Dense(1, activation='sigmoid'))
     ret.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
     return ret
@@ -62,7 +65,7 @@ def model():
 
 def preprocess_image(filename):
     im = load_img(filename, color_mode='grayscale', target_size=(IMAGE_DIM, IMAGE_DIM), interpolation='lanczos')
-    ret = img_to_array(im, dtype='float16')
+    ret = img_to_array(im, dtype=f'{DATA_TYPE}')
     return ret
 
 
@@ -80,7 +83,7 @@ def train(prev=None):
     #     y_train = []
     #     csv_reader = csv.reader(csv_file)
     #     for row in tqdm(csv_reader):
-    #         X_append, y_append = build_dataset(row[0], row[1])
+    #         X_append, y_append = build_dataset(row[0], int(row[1]))
     #         X_train += X_append
     #         y_train += y_append
     #
@@ -89,7 +92,7 @@ def train(prev=None):
     #     y_val = []
     #     csv_reader = csv.reader(csv_file)
     #     for row in tqdm(csv_reader):
-    #         X_append, y_append = build_dataset(row[0], row[1])
+    #         X_append, y_append = build_dataset(row[0], int(row[1]))
     #         X_val += X_append
     #         y_val += y_append
     #
@@ -101,17 +104,17 @@ def train(prev=None):
     # y_val = np.array(y_val)
     # X_val, y_val = unison_shuffled_copies(X_val, y_val)
     #
-    # with open(f'tf-{IMAGE_DIM}', 'wb') as file:
+    # with open(f'tf-{IMAGE_DIM}-{DATA_TYPE}', 'wb') as file:
     #     pickle.dump((X_train, y_train), file, protocol=4)
     #
-    # with open(f'vf-{IMAGE_DIM}', 'wb') as file:
+    # with open(f'vf-{IMAGE_DIM}-{DATA_TYPE}', 'wb') as file:
     #     pickle.dump((X_val, y_val), file, protocol=4)
 
-    with open(f'tf-{IMAGE_DIM}', 'rb') as file:
+    with open(f'tf-{IMAGE_DIM}-{DATA_TYPE}', 'rb') as file:
         load_train = pickle.load(file)
         X_train, y_train = load_train
 
-    with open(f'vf-{IMAGE_DIM}', 'rb') as file:
+    with open(f'vf-{IMAGE_DIM}-{DATA_TYPE}', 'rb') as file:
         load_val = pickle.load(file)
         X_val, y_val = load_val
 
@@ -119,13 +122,14 @@ def train(prev=None):
 
     X_val = X_val / 255.0
 
-    history = currModel.fit_generator(aug.flow(X_train, y_train, batch_size=64), validation_data=(X_val, y_val),
+    history = currModel.fit_generator(aug.flow(X_train, y_train, batch_size=32), validation_data=(X_val, y_val),
                                       verbose=1,
-                                      epochs=100,
+                                      epochs=1000,
                                       callbacks=callbacks,
-                                      steps_per_epoch=len(X_train) / 100)
+                                      steps_per_epoch=len(X_train) / 100,
+                                      initial_epoch=25)
 
-    # history = currModel.fit(x=X_train, y=y_train, batch_size=64, epochs=100, verbose=1, callbacks=callbacks, validation_data=(X_val, y_val))
+    # history = currModel.fit(x=X_train, y=y_train, batch_size=32, epochs=100, verbose=1, callbacks=callbacks, validation_data=(X_val, y_val))
 
     with open('history3', 'wb') as file:
         pickle.dump(history, file)
@@ -159,3 +163,6 @@ def build_dataset(directory_path, label):
         X += [preprocess_image(file)]
     y = [label] * len(X)
     return X, y
+
+if __name__ == '__main__':
+    train('xr200-float16-weights.25-0.65.hdf5')
