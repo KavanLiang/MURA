@@ -17,7 +17,7 @@ import tqdm as tqdm
 
 import sys
 
-MODEL_PATH = 'x200-float16-weights-32-128-256-256-512-512-512-512-.21-0.55.hdf5'
+MODEL_PATH = 'Models/reg200-float16-weights-c64x3-c128x4-c256x4-c256x4-c512x6-c512x6-d4096x2weights.131-0.52.hdf5'
 
 IMAGE_DIM = 200
 
@@ -40,34 +40,41 @@ def predict(input_csv_path, output_csv_path):
                     y = []
                     for file in glob.glob(current_study_dir + "*.png"):
                         processed_img = preprocess_image(file)
-                        y += [model.predict(processed_img.reshape((1,) + processed_img.shape)).item()]
-                    output_csv_writer.writerow([current_study_dir, int(round(np.array(y).mean()))])
+                        y += [model.predict(processed_img.reshape((1,) + processed_img.shape))]
+                    output_csv_writer.writerow([current_study_dir, np.array(y).mean(axis=0).argmax()])
 
 def test_validation():
     model = keras.models.load_model(MODEL_PATH)
     with open('MURA-v1.1/valid_labeled_studies.csv') as csv_file:
         csv_reader = csv.reader(csv_file)
-        tp = 0
-        fp = 0
-        tn = 0
-        fn = 0
+        agree = 0
+        label_p = 0
+        predict_p = 0
+        label_n = 0
+        predict_n = 0
+        total = 0
         for line in csv_reader:
             label = int(line[1])
+            total += 1
             y = []
             for file in glob.glob(line[0] + '*.png'):
                 processed_img = preprocess_image(file)
-                y += [model.predict(processed_img.reshape((1,) + processed_img.shape)).item()]
-            y = int(round(np.array(y).mean()))
+                y += [model.predict(processed_img.reshape((1,) + processed_img.shape))]
+            y = np.array(y).mean(axis=0).argmax()
             if label == 0:
-                fp += (label == y)
-                fn += (label == y)
+                label_n += 1
             else:
-                tp += (label == y)
-                tn += (label == y)
-    precision = tp / (tp + fp)
-    recall = tp / (tp + fn)
-    f1 = 2 * precision * recall / (precision + recall)
-    return precision, recall, f1
+                label_p += 1
+            if y == 0:
+                predict_n += 1
+            else:
+                predict_p += 1
+            if y == label:
+                agree += 1
+        p_0 = agree / total
+        p_e = ((predict_p / total) * (label_p / total)) + ((predict_n / total) * (label_n / total))
+        k = (p_0 - p_e)/(1-p_e)
+        return (agree, label_p, predict_p, label_n, predict_n, k)
 
 def visualize(img_dir):
     model = keras.models.load_model(MODEL_PATH)
@@ -86,4 +93,5 @@ def visualize(img_dir):
 
 
 if __name__ == '__main__':
-    visualize('MURA-v1.1/valid/XR_WRIST/patient11267/study1_positive/')
+    predict('MURA-v1.1/valid_image_paths.csv', 'out.csv')
+    print(test_validation())
