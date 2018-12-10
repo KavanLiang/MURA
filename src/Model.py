@@ -1,13 +1,14 @@
 import keras
-from keras.models import Sequential
-from keras.layers import Dense, Flatten, BatchNormalization, Dropout
+from keras.layers import Dense, Flatten, BatchNormalization, Dropout, GlobalAveragePooling2D, ReLU, Input, add, Softmax, \
+    LeakyReLU, multiply, Reshape, Activation
+from keras.models import Model
 from keras.layers.convolutional import Conv2D, MaxPooling2D
-from keras.callbacks import ModelCheckpoint, TensorBoard, Callback
+from keras.callbacks import ModelCheckpoint, TensorBoard, Callback, LearningRateScheduler
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, cohen_kappa_score
 from keras_preprocessing.image import ImageDataGenerator, load_img, img_to_array
 from keras.utils import to_categorical
-from keras import regularizers
 from keras import optimizers
+import tensorflow as tf
 import numpy as np
 import glob
 import csv
@@ -17,23 +18,39 @@ import random
 import os
 import re
 
+from shutil import copyfile
+
 from time import time
 
 SEED = 1337
 
 IMAGE_DIM = 200
 DATA_TYPE = 'float16'
-MODEL_NAME = f'reg{IMAGE_DIM}-{DATA_TYPE}-weights-c64x{3}-c128x{4}-c256x{8}-c256x{8}-c512x{12}-c512x{12}-d{4096}x{2}'
+
+NUM_64_BLOCK = 1
+NUM_128_BLOCK = 3
+NUM_256_1_BLOCK = 5
+NUM_256_2_BLOCK = 5
+NUM_512_1_BLOCK = 7
+NUM_512_2_BLOCK = 7
+
+BATCH_SIZE = 32
+
+NUM_TRAINING_EXAMPLES = 36808
+NUM_VALIDATION_EXAMPLES = 3197
+CLASS_WEIGHTS = [1, 1.6]
+
+INIT_LEARNING_RATE = 0.001
+init_epoch = 0
+
+MODEL_NAME = f'AMSGrad-SGD-SEN{IMAGE_DIM}-{DATA_TYPE}-weights-c64xr{NUM_64_BLOCK}-c128xr{NUM_128_BLOCK}-c256xr{NUM_256_1_BLOCK}-c256xr{NUM_256_2_BLOCK}-c512xr{NUM_512_1_BLOCK}-c512xr{NUM_512_2_BLOCK}-MAXPOOL'
 
 aug = ImageDataGenerator(
     rotation_range=45,
-    width_shift_range=0.2,
-    height_shift_range=0.2,
-    shear_range=0.2,
-    zoom_range=0.2,
-    fill_mode='nearest',
     horizontal_flip=True,
-    vertical_flip=True)
+    vertical_flip=True,
+    dtype='float16',
+    rescale=1 / 255.0)
 
 
 class Metrics(Callback):
@@ -63,11 +80,16 @@ class Metrics(Callback):
         return
 
 
+def step_decay(epoch):
+    return INIT_LEARNING_RATE * ((0.1) ** (max(epoch - init_epoch, 0) // 30))
+
+
 callbacks = [
-    Metrics(),
-    ModelCheckpoint(f'Models/{MODEL_NAME}/' + 'weights.{epoch:02d}-{val_loss:.2f}.hdf5', monitor='val_loss',
+    ModelCheckpoint(f'Models/{MODEL_NAME}/' + 'weights.{epoch:02d}-{val_loss:.2f}-new_best.hdf5', monitor='val_loss',
                     save_best_only=True,
                     verbose=1),
+    ModelCheckpoint(f'Models/{MODEL_NAME}/' + 'weights.{epoch:02d}-{val_loss:.2f}.hdf5', period=5, verbose=1),
+    LearningRateScheduler(step_decay),
     TensorBoard(log_dir=f'logs/{MODEL_NAME}')
 ]
 
@@ -78,230 +100,150 @@ def mkdir(file_path):
         os.makedirs(directory)
 
 
-def model():
-    ret = Sequential()
+def se_block(x, num_filters, ratio=16):
+    ret = GlobalAveragePooling2D()(x)
+    ret = Reshape((1, 1, num_filters))(ret)
+    ret = Dense(num_filters // ratio)(ret)
+    ret = LeakyReLU()(ret)
+    ret = Dense(num_filters)(ret)
+    ret = Activation('sigmoid')(ret)
+    return multiply([x, ret])
 
-    ret.add(Conv2D(64, kernel_size=(3, 3), strides=(2, 2), activation='relu', input_shape=(IMAGE_DIM, IMAGE_DIM, 1)))
-    ret.add(Conv2D(64, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(64, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
 
-    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(128, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(Conv2D(256, kernel_size=(3, 3), activation='relu', padding='same'))
-    ret.add(BatchNormalization())
-
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(Conv2D(512, kernel_size=(3, 3), padding='same', activation='relu'))
-    ret.add(BatchNormalization())
-
-    ret.add(MaxPooling2D(pool_size=(2, 2), strides=(2, 2)))
-
-    ret.add(Flatten())
-    ret.add(Dense(4096, activation='relu', kernel_regularizer=regularizers.l2(0.001)))
-    ret.add(Dropout(0.5))
-    ret.add(Dense(4096, activation='relu', kernel_regularizer=regularizers.l2(0.001)))
-    ret.add(Dropout(0.5))
-    ret.add(Dense(2, activation='softmax'))
-
-    optimizer = optimizers.Adam(amsgrad=True)
-    ret.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+def se_res_block(x, num_filters, num_convs, kernel_size, strides=(1, 1)):
+    res = x
+    if strides != (1, 1) or res._keras_shape[-1] != num_filters:
+        res = Conv2D(num_filters, (1, 1), padding='same', strides=strides)(x)
+    ret = nested_conv_layer(x, num_filters, num_convs, kernel_size, strides=strides)
+    ret = se_block(ret, num_filters)
+    ret = add([res, ret])
+    ret = BatchNormalization()(ret)
+    ret = LeakyReLU()(ret)
     return ret
 
 
-def preprocess_image(filename):
-    im = load_img(filename, color_mode='grayscale', target_size=(IMAGE_DIM, IMAGE_DIM), interpolation='lanczos')
-    ret = img_to_array(im, dtype=f'{DATA_TYPE}')
+def nested_conv_layer(x, num_filters, num_convs, kernel_size, strides=(1, 1)):
+    ret = Conv2D(num_filters, kernel_size=kernel_size, strides=strides, padding='same')(x)
+    for i in range(num_convs - 1):
+        ret = BatchNormalization()(ret)
+        ret = LeakyReLU()(ret)
+        ret = Conv2D(num_filters, kernel_size=kernel_size, strides=strides, padding='same')(ret)
+    return ret
+
+
+def model():
+    inp = Input(shape=(IMAGE_DIM, IMAGE_DIM, 1))
+    x = inp
+
+    x = Conv2D(64, kernel_size=(3, 3), strides=(2, 2), padding='same')(x)
+    for i in range(NUM_64_BLOCK - 1):
+        x = se_res_block(x, 256, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    for i in range(NUM_128_BLOCK):
+        x = se_res_block(x, 128, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    for i in range(NUM_256_1_BLOCK):
+        x = se_res_block(x, 256, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    for i in range(NUM_256_2_BLOCK):
+        x = se_res_block(x, 256, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    for i in range(NUM_512_1_BLOCK):
+        x = se_res_block(x, 512, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    for i in range(NUM_512_2_BLOCK):
+        x = se_res_block(x, 512, 2, (3, 3))
+    x = MaxPooling2D(pool_size=(2, 2))(x)
+
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(2)(x)
+    x = Softmax()(x)
+
+    ret = Model(inputs=[inp], outputs=x)
     return ret
 
 
 def train(prev=None):
+    global init_epoch
     if prev:
-        currModel = keras.models.load_model(prev)
+        curr_model = keras.models.load_model(prev)
+        init_epoch = int(
+            re.search('[0-9]+', re.search('weights\.[0-9]+-', prev).group(0)).group(
+                0))
     else:
-        currModel = model()
+        curr_model = model()
 
+    optimizer = optimizers.SGD(lr=INIT_LEARNING_RATE)
+    curr_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+
+    print(curr_model.summary())
     mkdir(f'Models/{MODEL_NAME}/')
 
     random.seed(SEED)
     np.random.seed(SEED)
 
-    # with open('MURA-v1.1/train_labeled_studies.csv') as csv_file:
-    #     X_train = []
-    #     y_train = []
-    #     csv_reader = csv.reader(csv_file)
-    #     for row in tqdm(csv_reader):
-    #         X_append, y_append = build_dataset(row[0], int(row[1]))
-    #         X_train += X_append
-    #         y_train += y_append
-    #
-    # with open('MURA-v1.1/valid_labeled_studies.csv') as csv_file:
-    #     X_val = []
-    #     y_val = []
-    #     csv_reader = csv.reader(csv_file)
-    #     for row in tqdm(csv_reader):
-    #         X_append, y_append = build_dataset(row[0], int(row[1]))
-    #         X_val += X_append
-    #         y_val += y_append
-    #
-    # X_train = np.array(X_train)
-    # y_train = np.array(y_train)
-    # X_train, y_train = unison_shuffled_copies(X_train, y_train)
-    #
-    # X_val = np.array(X_val)
-    # y_val = np.array(y_val)
-    # X_val, y_val = unison_shuffled_copies(X_val, y_val)
-    #
-    # with open(f'tf-{IMAGE_DIM}-{DATA_TYPE}', 'wb') as file:
-    #     pickle.dump((X_train, y_train), file, protocol=4)
-    #
-    # with open(f'vf-{IMAGE_DIM}-{DATA_TYPE}', 'wb') as file:
-    #     pickle.dump((X_val, y_val), file, protocol=4)
-
-    print('Loading Train/Val Sets')
-
-    with open(f'tf-{IMAGE_DIM}-{DATA_TYPE}', 'rb') as file:
-        load_train = pickle.load(file)
-        X_train, y_train = load_train
-
-    with open(f'vf-{IMAGE_DIM}-{DATA_TYPE}', 'rb') as file:
-        load_val = pickle.load(file)
-        X_val, y_val = load_val
-
-    X_train = X_train / 255.0
-
-    X_val = X_val / 255.0
-
-    class_weights = [1, 1.6]
-
-    y_train = to_categorical(y_train).astype('uint8')
-    y_val = to_categorical(y_val).astype('uint8')
-
     print('Fitting Model')
 
     if (prev):
-        history = currModel.fit_generator(aug.flow(X_train, y_train, batch_size=64), validation_data=(X_val, y_val),
-                                          verbose=1,
-                                          epochs=1000,
-                                          callbacks=callbacks,
-                                          steps_per_epoch=len(X_train) / 100,
-                                          class_weight={v: k for v, k in enumerate(class_weights)},
-                                          initial_epoch=int(
-                                              re.search('[0-9]+', re.search('weights\.[0-9]+-', prev).group(0)).group(
-                                                  0)))
+        history = curr_model.fit_generator(
+            aug.flow_from_directory('trainingdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
+                                    class_mode='categorical', batch_size=32),
+            validation_data=aug.flow_from_directory('valdata/', target_size=(IMAGE_DIM, IMAGE_DIM),
+                                                    color_mode='grayscale',
+                                                    class_mode='categorical', batch_size=32),
+            validation_steps=NUM_VALIDATION_EXAMPLES / BATCH_SIZE,
+            verbose=1,
+            epochs=1000,
+            callbacks=callbacks,
+            steps_per_epoch=NUM_TRAINING_EXAMPLES / BATCH_SIZE,
+            class_weight={v: k for v, k in enumerate(CLASS_WEIGHTS)},
+            initial_epoch=init_epoch)
     else:
-        history = currModel.fit_generator(aug.flow(X_train, y_train, batch_size=64), validation_data=(X_val, y_val),
-                                          verbose=1,
-                                          epochs=1000,
-                                          callbacks=callbacks,
-                                          steps_per_epoch=len(X_train) / 100,
-                                          class_weight={v: k for v, k in enumerate(class_weights)})
-
-    # history = currModel.fit(x=X_train, y=y_train, batch_size=64, epochs=1000, verbose=1, callbacks=callbacks, validation_data=(X_val, y_val), shuffle=True, class_weight={v: k for v, k in enumerate(class_weights)})
-
-
-def unison_shuffled_copies(a, b):
-    assert len(a) == len(b)
-    p = np.random.permutation(len(a))
-    return a[p], b[p]
+        history = curr_model.fit_generator(
+            aug.flow_from_directory('trainingdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
+                                    class_mode='categorical', batch_size=32),
+            validation_data=aug.flow_from_directory('valdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
+                                                    class_mode='categorical', batch_size=32),
+            validation_steps=NUM_VALIDATION_EXAMPLES / BATCH_SIZE,
+            verbose=1,
+            epochs=1000,
+            callbacks=callbacks,
+            steps_per_epoch=NUM_TRAINING_EXAMPLES / BATCH_SIZE,
+            class_weight={v: k for v, k in enumerate(CLASS_WEIGHTS)})
 
 
-def build_dataset(directory_path, label):
-    X = []
-    for file in glob.glob(directory_path + "*.png"):
-        X += [preprocess_image(file)]
-    y = [label] * len(X)
-    return X, y
+def build_dataset_directories():
+    mkdir('trainingdata/')
+    mkdir('trainingdata/0/')
+    mkdir('trainingdata/1/')
+    mkdir('valdata/')
+    mkdir('valdata/0/')
+    mkdir('valdata/1/')
+    with open('MURA-v1.1/train_labeled_studies.csv') as csv_file:
+        train_count = 0
+        csv_reader = csv.reader(csv_file)
+        for row in tqdm(csv_reader):
+            train_count = process_and_save_examples(row[0], 'trainingdata/', row[1], train_count)
+
+    with open('MURA-v1.1/valid_labeled_studies.csv') as csv_file:
+        val_count = 0
+        csv_reader = csv.reader(csv_file)
+        for row in tqdm(csv_reader):
+            val_count = process_and_save_examples(row[0], 'valdata/', row[1], val_count)
+
+
+def process_and_save_examples(read_directory_path, write_directory_path, label, count):
+    working_count = count
+    for file in glob.glob(read_directory_path + '*.png'):
+        copyfile(file, f'{write_directory_path}/{label}/{working_count}.png')
+        working_count += 1
+    return working_count
 
 
 if __name__ == '__main__':
-    train(
-        'Models/reg200-float16-weights-c64x3-c128x4-c256x8-c256x8-c512x12-c512x12-d4096x2/reg200-float16-weights-c64x3-c128x4-c256x8-c256x8-c512x12-c512x12-d4096x2weights.412-0.47.hdf5')
+    train('Models/AMSGrad-SEN200-float16-weights-c64xr1-c128xr3-c256xr5-c256xr5-c512xr7-c512xr7-MAXPOOL/weights.111-0.65-new_best.hdf5')
