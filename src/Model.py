@@ -1,38 +1,32 @@
-import keras
-from keras.layers import Dense, Flatten, BatchNormalization, Dropout, GlobalAveragePooling2D, ReLU, Input, add, Softmax, \
-    LeakyReLU, multiply, Reshape, Activation
-from keras.models import Model
-from keras.layers.convolutional import Conv2D, MaxPooling2D
-from keras.callbacks import ModelCheckpoint, TensorBoard, Callback, LearningRateScheduler
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, cohen_kappa_score
-from keras_preprocessing.image import ImageDataGenerator, load_img, img_to_array
-from keras.utils import to_categorical
-from keras import optimizers
-import tensorflow as tf
-import numpy as np
-import glob
 import csv
-import pickle
-from tqdm import *
-import random
+import glob
 import os
+import random
 import re
-
 from shutil import copyfile
 
-from time import time
+import keras
+import numpy as np
+from keras import optimizers
+from keras.callbacks import ModelCheckpoint, TensorBoard, ReduceLROnPlateau
+from keras.layers import Dense, BatchNormalization, Input, add, ReLU, multiply, Reshape, Activation, GlobalMaxPooling2D, GlobalAveragePooling2D
+from keras.layers.convolutional import Conv2D, MaxPooling2D
+from keras.models import Model
+from keras_preprocessing.image import ImageDataGenerator
+from keras.regularizers import l1_l2
+from tqdm import *
+from keras.initializers import glorot_normal
 
-SEED = 1337
-
+SEED = 69
 IMAGE_DIM = 200
 DATA_TYPE = 'float16'
 
-NUM_64_BLOCK = 1
-NUM_128_BLOCK = 3
-NUM_256_1_BLOCK = 5
-NUM_256_2_BLOCK = 5
-NUM_512_1_BLOCK = 7
-NUM_512_2_BLOCK = 7
+NUM_64_BLOCK = 3
+NUM_128_BLOCK = 7
+NUM_256_BLOCK = 28
+NUM_512_BLOCK = 7
+
+BOTTLENECK_RATIO = 1
 
 BATCH_SIZE = 32
 
@@ -40,184 +34,221 @@ NUM_TRAINING_EXAMPLES = 36808
 NUM_VALIDATION_EXAMPLES = 3197
 CLASS_WEIGHTS = [1, 1.6]
 
-INIT_LEARNING_RATE = 0.001
+INIT_LEARNING_RATE = 1e-4
+ALPHA_REG = 1e-5
 init_epoch = 0
 
-MODEL_NAME = f'AMSGrad-SGD-SEN{IMAGE_DIM}-{DATA_TYPE}-weights-c64xr{NUM_64_BLOCK}-c128xr{NUM_128_BLOCK}-c256xr{NUM_256_1_BLOCK}-c256xr{NUM_256_2_BLOCK}-c512xr{NUM_512_1_BLOCK}-c512xr{NUM_512_2_BLOCK}-MAXPOOL'
+MODEL_NAME = f'Adam-DECAY-{INIT_LEARNING_RATE}-PREACTIVATION-ImageDIM{IMAGE_DIM}-l1_l2-REG-{ALPHA_REG}-{DATA_TYPE}-weights-c64xr{NUM_64_BLOCK}-c128xr{NUM_128_BLOCK}-' \
+             f'c256xr{NUM_256_BLOCK}-c512xr{NUM_512_BLOCK}-MAXPOOL'
 
 aug = ImageDataGenerator(
     rotation_range=45,
     horizontal_flip=True,
     vertical_flip=True,
-    dtype='float16',
-    rescale=1 / 255.0)
-
-
-class Metrics(Callback):
-
-    def __init__(self):
-        super().__init__()
-        self.val_f1s = []
-        self.val_recalls = []
-        self.val_precisions = []
-        self.kappas = []
-
-    def on_train_begin(self, logs={}):
-        return
-
-    def on_epoch_end(self, epoch, logs={}):
-        val_predict = (np.asarray(self.model.predict(self.validation_data[0]))).round()
-        val_targ = self.validation_data[1]
-        _val_f1 = f1_score(val_targ, val_predict, average='micro')
-        _val_recall = recall_score(val_targ, val_predict, average='micro')
-        _val_precision = precision_score(val_targ, val_predict, average='micro')
-        _val_cohens_kappa = cohen_kappa_score(val_targ.argmax(axis=1), val_predict.argmax(axis=1))
-        self.val_f1s.append(_val_f1)
-        self.val_recalls.append(_val_recall)
-        self.val_precisions.append(_val_precision)
-        print(
-            f' - val_f1: {_val_f1} - val_precision: {_val_precision} - val_recall: {_val_recall} - val_cohens_kappa: {_val_cohens_kappa}')
-        return
-
-
-def step_decay(epoch):
-    return INIT_LEARNING_RATE * ((0.1) ** (max(epoch - init_epoch, 0) // 30))
-
+    dtype='float16'
+    )
 
 callbacks = [
     ModelCheckpoint(f'Models/{MODEL_NAME}/' + 'weights.{epoch:02d}-{val_loss:.2f}-new_best.hdf5', monitor='val_loss',
                     save_best_only=True,
-                    verbose=1),
+                    verbose=0),
     ModelCheckpoint(f'Models/{MODEL_NAME}/' + 'weights.{epoch:02d}-{val_loss:.2f}.hdf5', period=5, verbose=1),
-    LearningRateScheduler(step_decay),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=50, verbose=1),
     TensorBoard(log_dir=f'logs/{MODEL_NAME}')
 ]
 
 
 def mkdir(file_path):
+    """
+    Make a new directory
+
+    #Arguments
+        file_path: the name of the new directory
+    """
     directory = os.path.dirname(file_path)
     if not os.path.exists(directory):
         os.makedirs(directory)
 
 
-def se_block(x, num_filters, ratio=16):
+def se_block(x, ratio=16):
+    """
+    A squeeze excitation implementation
+
+    #Arguments
+        x: input layer
+        ratio: ratio to scale dense layers
+    """
+    num_filters = x._keras_shape[-1]
     ret = GlobalAveragePooling2D()(x)
     ret = Reshape((1, 1, num_filters))(ret)
-    ret = Dense(num_filters // ratio)(ret)
-    ret = LeakyReLU()(ret)
-    ret = Dense(num_filters)(ret)
+    ret = Dense(num_filters // ratio, kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG),)(ret)
+    ret = ReLU()(ret)
+    ret = Dense(num_filters, kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG),)(ret)
     ret = Activation('sigmoid')(ret)
     return multiply([x, ret])
 
 
-def se_res_block(x, num_filters, num_convs, kernel_size, strides=(1, 1)):
-    res = x
-    if strides != (1, 1) or res._keras_shape[-1] != num_filters:
-        res = Conv2D(num_filters, (1, 1), padding='same', strides=strides)(x)
-    ret = nested_conv_layer(x, num_filters, num_convs, kernel_size, strides=strides)
-    ret = se_block(ret, num_filters)
-    ret = add([res, ret])
+def se_res_block(x, num_filters, strides=(1, 1)):
+    """
+    A squeeze excitation residual block
+
+    #Arguments
+        x: the input layer
+        num_filters: number of convolutional filters to use
+        strides: the stride to use in the conv layers
+    """
+    ret = BatchNormalization()(x)
+    ret = ReLU()(ret)
+
+    ret = Conv2D(num_filters, kernel_size=(1, 1), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), padding='same')(ret)
     ret = BatchNormalization()(ret)
-    ret = LeakyReLU()(ret)
+    ret = ReLU()(ret)
+
+    ret = Conv2D(num_filters, kernel_size=(3, 3), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), strides=strides, padding='same')(ret)
+    ret = BatchNormalization()(ret)
+    ret = ReLU()(ret)
+
+    ret = Conv2D(num_filters * BOTTLENECK_RATIO, kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), kernel_size=(1, 1), padding='same')(ret)
+
+    ret = se_block(ret, num_filters)
+
+    if strides != (1, 1) or x._keras_shape[-1] != num_filters * BOTTLENECK_RATIO:
+        ret = add([Conv2D(num_filters * BOTTLENECK_RATIO, kernel_size=(1, 1), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), padding='same', strides=strides)(x), ret])
+    else:
+        ret = add([x, ret])
     return ret
 
 
-def nested_conv_layer(x, num_filters, num_convs, kernel_size, strides=(1, 1)):
-    ret = Conv2D(num_filters, kernel_size=kernel_size, strides=strides, padding='same')(x)
-    for i in range(num_convs - 1):
-        ret = BatchNormalization()(ret)
-        ret = LeakyReLU()(ret)
-        ret = Conv2D(num_filters, kernel_size=kernel_size, strides=strides, padding='same')(ret)
-    return ret
+def se_res_model(layers):
+    """
+    A squeeze-excitation Binary Classification RESnet implementation.
 
+    #Arguments
+        layers: a list pertaining to the number of 64, 128, 256, and 512 resnet blocks in the network.
 
-def model():
+    Returns a squeese excitation network RESnet model defined by the given layer list.
+    """
     inp = Input(shape=(IMAGE_DIM, IMAGE_DIM, 1))
-    x = inp
 
-    x = Conv2D(64, kernel_size=(3, 3), strides=(2, 2), padding='same')(x)
-    for i in range(NUM_64_BLOCK - 1):
-        x = se_res_block(x, 256, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = Conv2D(64, kernel_size=(3, 3), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), padding='same', strides=(2, 2))(inp)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
 
-    for i in range(NUM_128_BLOCK):
-        x = se_res_block(x, 128, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = MaxPooling2D()(x)
 
-    for i in range(NUM_256_1_BLOCK):
-        x = se_res_block(x, 256, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    for i in range(layers[0]):
+        x = se_res_block(x, 64)
 
-    for i in range(NUM_256_2_BLOCK):
-        x = se_res_block(x, 256, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = se_res_block(x, 128, strides=(2, 2))
+    for i in range(layers[1] - 1):
+        x = se_res_block(x, 128)
 
-    for i in range(NUM_512_1_BLOCK):
-        x = se_res_block(x, 512, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = se_res_block(x, 256, strides=(2, 2))
+    for i in range(layers[2] - 1):
+        x = se_res_block(x, 256)
 
-    for i in range(NUM_512_2_BLOCK):
-        x = se_res_block(x, 512, 2, (3, 3))
-    x = MaxPooling2D(pool_size=(2, 2))(x)
+    x = se_res_block(x, 512, strides=(2, 2))
+    for i in range(layers[3] - 1):
+        x = se_res_block(x, 512)
 
-    x = GlobalAveragePooling2D()(x)
-    x = Dense(2)(x)
-    x = Softmax()(x)
+    x = GlobalMaxPooling2D()(x)
+    x = Dense(1, kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG))(x)
+    x = Activation('sigmoid')(x)
 
     ret = Model(inputs=[inp], outputs=x)
     return ret
 
+def _conv_block(x, num_filters, bottleneck=False):
+    ret = BatchNormalization()(x)
+    ret = ReLU()(ret)
+    if bottleneck:
+        ret = Conv2D(num_filters * BOTTLENECK_RATIO, (1, 1), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), padding='same')(ret)
+        ret = BatchNormalization()(ret)
+        ret = ReLU(ret)
+    ret = Conv2D(num_filters, (3, 3), kernel_initializer=glorot_normal(SEED), kernel_regularizer=l1_l2(ALPHA_REG, ALPHA_REG), padding='same')(ret)
+    return ret
 
-def train(prev=None):
+def dense_block(x, num_layers, num_filters, growth_rate, bottleneck=False):
+    pass
+
+
+
+def train(train_from=None, use_latest=False, recompile=False, new_dir=False):
+    """
+    Train a model.
+
+    train_from: the filepath to the model to train from, if specified.
+    use_latest: whether or not to start training from the last saved model of the same name
+    recompile: whether or not to recompile the model before training
+    new_dir: whether or not to create a new directory
+    """
     global init_epoch
-    if prev:
-        curr_model = keras.models.load_model(prev)
+
+    if train_from:
+        curr_model = keras.models.load_model(train_from)
         init_epoch = int(
-            re.search('[0-9]+', re.search('weights\.[0-9]+-', prev).group(0)).group(
+            re.search('[0-9]+', re.search('weights\.[0-9]+-', train_from).group(0)).group(
+                0))
+    elif use_latest:
+        latest = max(glob.glob(f'Models/{MODEL_NAME}/*.hdf5'), key=os.path.getctime)
+        curr_model = keras.models.load_model(latest)
+        init_epoch = int(
+            re.search('[0-9]+', re.search('weights\.[0-9]+-', latest).group(0)).group(
                 0))
     else:
-        curr_model = model()
-
-    optimizer = optimizers.SGD(lr=INIT_LEARNING_RATE)
-    curr_model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+        curr_model = se_res_model([NUM_64_BLOCK, NUM_128_BLOCK, NUM_256_BLOCK, NUM_512_BLOCK])
+        curr_model.compile(optimizers.Adam(lr=INIT_LEARNING_RATE), loss='binary_crossentropy', metrics=['accuracy'])
 
     print(curr_model.summary())
-    mkdir(f'Models/{MODEL_NAME}/')
+
+    if new_dir:
+        mkdir(f'Models/{MODEL_NAME}/')
 
     random.seed(SEED)
     np.random.seed(SEED)
 
     print('Fitting Model')
 
-    if (prev):
+    if train_from or use_latest:
         history = curr_model.fit_generator(
-            aug.flow_from_directory('trainingdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
-                                    class_mode='categorical', batch_size=32),
-            validation_data=aug.flow_from_directory('valdata/', target_size=(IMAGE_DIM, IMAGE_DIM),
+            aug.flow_from_directory('trainingdata/',
+                                    target_size=(IMAGE_DIM, IMAGE_DIM),
+                                    color_mode='grayscale',
+                                    class_mode='binary',
+                                    batch_size=BATCH_SIZE),
+            validation_data=aug.flow_from_directory('valdata/',
+                                                    target_size=(IMAGE_DIM, IMAGE_DIM),
                                                     color_mode='grayscale',
-                                                    class_mode='categorical', batch_size=32),
+                                                    class_mode='binary',
+                                                    batch_size=BATCH_SIZE),
             validation_steps=NUM_VALIDATION_EXAMPLES / BATCH_SIZE,
             verbose=1,
-            epochs=1000,
+            epochs=10000,
             callbacks=callbacks,
-            steps_per_epoch=NUM_TRAINING_EXAMPLES / BATCH_SIZE,
+            steps_per_epoch=NUM_TRAINING_EXAMPLES / (4 * BATCH_SIZE),
             class_weight={v: k for v, k in enumerate(CLASS_WEIGHTS)},
             initial_epoch=init_epoch)
     else:
         history = curr_model.fit_generator(
-            aug.flow_from_directory('trainingdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
-                                    class_mode='categorical', batch_size=32),
-            validation_data=aug.flow_from_directory('valdata/', target_size=(IMAGE_DIM, IMAGE_DIM), color_mode='grayscale',
-                                                    class_mode='categorical', batch_size=32),
+            aug.flow_from_directory('trainingdata/',
+                                    target_size=(IMAGE_DIM, IMAGE_DIM),
+                                    color_mode='grayscale',
+                                    class_mode='binary',
+                                    batch_size=BATCH_SIZE),
+            validation_data=aug.flow_from_directory('valdata/',
+                                                    target_size=(IMAGE_DIM, IMAGE_DIM),
+                                                    color_mode='grayscale',
+                                                    class_mode='binary', batch_size=BATCH_SIZE),
             validation_steps=NUM_VALIDATION_EXAMPLES / BATCH_SIZE,
             verbose=1,
-            epochs=1000,
+            epochs=10000,
             callbacks=callbacks,
-            steps_per_epoch=NUM_TRAINING_EXAMPLES / BATCH_SIZE,
+            steps_per_epoch=NUM_TRAINING_EXAMPLES / (4 * BATCH_SIZE),
             class_weight={v: k for v, k in enumerate(CLASS_WEIGHTS)})
 
 
 def build_dataset_directories():
+    """Sorts and copies the training and validation data into more ImageGenerator friendly directories"""
     mkdir('trainingdata/')
     mkdir('trainingdata/0/')
     mkdir('trainingdata/1/')
@@ -238,6 +269,7 @@ def build_dataset_directories():
 
 
 def process_and_save_examples(read_directory_path, write_directory_path, label, count):
+    """Copy training/validation files from one directory to another in a folder with matching label"""
     working_count = count
     for file in glob.glob(read_directory_path + '*.png'):
         copyfile(file, f'{write_directory_path}/{label}/{working_count}.png')
@@ -246,4 +278,4 @@ def process_and_save_examples(read_directory_path, write_directory_path, label, 
 
 
 if __name__ == '__main__':
-    train('Models/AMSGrad-SEN200-float16-weights-c64xr1-c128xr3-c256xr5-c256xr5-c512xr7-c512xr7-MAXPOOL/weights.111-0.65-new_best.hdf5')
+    train(new_dir=True)
